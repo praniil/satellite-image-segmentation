@@ -1,5 +1,5 @@
 /venv
 /dataset
 /src/segformer_ktm_satellite_image_small_data
-/src/segformer_ktm_satellite_image_small_data
+/src/segformer_ktm_satellite_image
 /src/wandb/

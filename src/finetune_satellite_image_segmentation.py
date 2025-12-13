@@ -17,18 +17,17 @@ import wandb
 # ==============================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 num_classes = 13
-batch_size = 4          # small batch size for limited data
+batch_size = 16          # increased batch size
 learning_rate = 3e-5
 num_epochs = 100
 image_size = 256
 patience = 7
-num_folds = 5           # more folds for small dataset
-accumulation_steps = 4
+num_folds = 2            # fewer folds for small dataset
 
 train_img_dir = "../dataset/satellite_image_and_mask/Annotation/images"
 train_mask_dir = "../dataset/satellite_image_and_mask/Annotation/label-mask"
 
-output_dir = "./segformer_ktm_satellite_image_small_data"
+output_dir = "./segformer_ktm_datasets"
 os.makedirs(output_dir, exist_ok=True)
 checkpoint_dir = os.path.join(output_dir, "checkpoints")
 os.makedirs(checkpoint_dir, exist_ok=True)
@@ -59,7 +58,15 @@ class SegDataset(Dataset):
 
         encoded = feature_extractor(images=img, return_tensors="pt")
         pixel_values = encoded["pixel_values"].squeeze()
-        return pixel_values, mask.clone().long()
+
+        # Fix: convert mask safely
+        if isinstance(mask, np.ndarray):
+            mask_tensor = torch.from_numpy(mask).long()
+        else:
+            mask_tensor = mask.long()  # already a tensor
+
+        return pixel_values, mask_tensor
+
 
 # ==============================
 # DATA AUGMENTATIONS
@@ -68,11 +75,6 @@ train_tf = A.Compose([
     A.HorizontalFlip(p=0.5),
     A.VerticalFlip(p=0.5),
     A.RandomRotate90(p=0.5),
-    A.RandomScale(scale_limit=0.2, p=0.5),
-    A.GridDistortion(p=0.3),
-    A.ElasticTransform(p=0.3),
-    A.ColorJitter(0.2, 0.2, 0.2, 0.1, p=0.5),
-    A.RandomBrightnessContrast(p=0.3),
     A.Resize(image_size, image_size),
     ToTensorV2()
 ])
@@ -81,7 +83,7 @@ train_tf = A.Compose([
 # FEATURE EXTRACTOR
 # ==============================
 feature_extractor = SegformerImageProcessor.from_pretrained(
-    "nvidia/segformer-b2-finetuned-ade-512-512"
+    "nvidia/segformer-b0-finetuned-ade-512-512"  # smaller model
 )
 
 # ==============================
@@ -133,17 +135,12 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(all_indices), 1):
     # MODEL
     # ==============================
     model = SegformerForSemanticSegmentation.from_pretrained(
-        "nvidia/segformer-b2-finetuned-ade-512-512",
+        "nvidia/segformer-b0-finetuned-ade-512-512",
         num_labels=num_classes,
         ignore_mismatched_sizes=True
     ).to(device)
 
-    # Freeze encoder initially
-    for param in model.segformer.encoder.parameters():
-        param.requires_grad = False
-
-    if hasattr(model.decode_head, 'dropout'):
-        model.decode_head.dropout = torch.nn.Dropout2d(p=0.2)
+    # No freezing
 
     # ==============================
     # CLASS WEIGHTS
@@ -159,9 +156,9 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(all_indices), 1):
     criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler(device='cuda')
 
-    wandb.init(project="segformer_ktm_small_data", name=f"fold_{fold}", reinit=True)
+    wandb.init(project="segformer_ktm_datasets", name=f"fold_{fold}", reinit=True)
     wandb.config.update({
         "fold": fold,
         "num_classes": num_classes,
@@ -176,12 +173,6 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(all_indices), 1):
     no_improve_epochs = 0
 
     for epoch in range(num_epochs):
-        # Unfreeze encoder after 5 epochs
-        if epoch == 5:
-            for param in model.segformer.encoder.parameters():
-                param.requires_grad = True
-            print("Encoder unfrozen for fine-tuning.")
-
         # TRAINING
         model.train()
         total_train_loss = 0.0
@@ -189,17 +180,16 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(all_indices), 1):
 
         for step, (imgs, masks) in enumerate(tqdm(train_loader, desc=f"Training Fold {fold} Epoch {epoch+1}")):
             imgs, masks = imgs.to(device), masks.to(device)
-            with torch.cuda.amp.autocast():
+            with torch.amp.autocast('cuda'):
                 outputs = model(pixel_values=imgs, labels=masks)
-                loss = outputs.loss / accumulation_steps
+                loss = outputs.loss
 
             scaler.scale(loss).backward()
-            if (step + 1) % accumulation_steps == 0 or (step + 1) == len(train_loader):
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
 
-            total_train_loss += (loss.item() * accumulation_steps)
+            total_train_loss += loss.item()
             total_train_iou += mean_iou(outputs.logits.detach(), masks, num_classes).item()
 
         avg_train_loss = total_train_loss / len(train_loader)
@@ -213,7 +203,7 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(all_indices), 1):
         with torch.no_grad():
             for imgs, masks in tqdm(val_loader, desc=f"Validation Fold {fold}"):
                 imgs, masks = imgs.to(device), masks.to(device)
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):
                     outputs = model(pixel_values=imgs, labels=masks)
                     loss = outputs.loss
 

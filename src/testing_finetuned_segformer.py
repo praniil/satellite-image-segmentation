@@ -3,22 +3,20 @@ import torch
 from transformers import SegformerForSemanticSegmentation, SegformerFeatureExtractor
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib
-matplotlib.use('Qt5Agg')
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 num_classes = 13
 
 # Load the image
-img_path = "../dataset/satellite_image_and_mask/Annotation/images/output_656.png"
+img_path = "../dataset/satellite_image_and_mask/Annotation/images/output_661.png"
 image = Image.open(img_path).convert("RGB")
 
 # Load processor
-feature_extractor = SegformerFeatureExtractor.from_pretrained("nvidia/segformer-b2-finetuned-ade-512-512")
+feature_extractor = SegformerFeatureExtractor.from_pretrained("nvidia/segformer-b0-finetuned-ade-512-512")
 
 # Load base model and then load your fine-tuned checkpoint
 model = SegformerForSemanticSegmentation.from_pretrained(
-    "nvidia/segformer-b2-finetuned-ade-512-512",
+    "nvidia/segformer-b0-finetuned-ade-512-512",
     num_labels=num_classes,
     ignore_mismatched_sizes=True
 ).to(device)
@@ -26,7 +24,7 @@ model = SegformerForSemanticSegmentation.from_pretrained(
 # Load your fine-tuned weights
 # src/finetuning_segformer/segformer_after_regularization
 # src/finetuning_segformer/segformer_improved_unfreezed_ encoder/checkpoints/best_model_fold1.pth
-checkpoint_path = "segformer_ktm_satellite_image_small_data/checkpoints/best_model_fold3.pth"
+checkpoint_path = "segformer_ktm_datasets/checkpoints/best_model_fold1.pth"
 model.load_state_dict(torch.load(checkpoint_path, map_location=device))
 model.eval()
 
@@ -73,4 +71,5 @@ plt.subplot(1, 2, 2)
 plt.imshow(seg_image)
 plt.title("Segmentation")
 plt.axis("off")
-plt.show()
+plt.savefig("segformer_prediction.png", dpi=300, bbox_inches="tight")
+plt.close()

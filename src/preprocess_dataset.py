@@ -1,9 +1,12 @@
 import os
 
-images = os.listdir("../dataset/satellite_image_and_mask/Annotation/images")
-masks = os.listdir("../dataset/satellite_image_and_mask/Annotation/masks")
-label_masks = os.listdir("../dataset/satellite_image_and_mask/Annotation/label-mask")
+images = os.listdir("../new_dataset/images")
+masks = os.listdir("../new_dataset/masks")
+label_masks = os.listdir("../new_dataset/label-mask")
 
 print(len(images))
 print(len(masks))
 print(len(label_masks))
+
+extra = set(images) - set(masks)
+print(extra)

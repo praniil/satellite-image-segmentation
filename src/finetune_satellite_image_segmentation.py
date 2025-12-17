@@ -1,48 +1,45 @@
 import os
-import csv
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
+
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, Subset
+from torch.amp import autocast, GradScaler
+
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
+
 from transformers import SegformerForSemanticSegmentation, SegformerImageProcessor
-import torch.nn.functional as F
 from sklearn.model_selection import KFold
 import wandb
 
-# ==============================
-# CONFIGURATION
-# ==============================
+# ================= CONFIG =================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-num_classes = 13
-batch_size = 16          # increased batch size
+
+num_classes = 7  # background (0) + 6 label classes
+batch_size = 16
 learning_rate = 3e-5
 num_epochs = 100
-image_size = 256
-patience = 7
-num_folds = 2            # fewer folds for small dataset
+image_size = 512  # increased from 256 for better SegFormer performance
+patience = 10
+num_folds = 5
 
-train_img_dir = "../dataset/satellite_image_and_mask/Annotation/images"
-train_mask_dir = "../dataset/satellite_image_and_mask/Annotation/label-mask"
+img_dir = "../new_dataset/images"
+mask_dir = "../new_dataset/label-mask"
 
-output_dir = "./segformer_ktm_datasets"
+output_dir = "./outputs_new_annotation_1200"
 os.makedirs(output_dir, exist_ok=True)
-checkpoint_dir = os.path.join(output_dir, "checkpoints")
-os.makedirs(checkpoint_dir, exist_ok=True)
-log_file = os.path.join(output_dir, "kfold_training_log.csv")
 
-# ==============================
-# DATASET
-# ==============================
+# ================= DATASET =================
 class SegDataset(Dataset):
-    def __init__(self, img_dir, mask_dir, feature_extractor, transforms=None):
+    def __init__(self, img_dir, mask_dir, processor, transforms):
         self.img_dir = img_dir
         self.mask_dir = mask_dir
         self.images = sorted(os.listdir(img_dir))
         self.masks = sorted(os.listdir(mask_dir))
-        self.feature_extractor = feature_extractor
+        self.processor = processor
         self.transforms = transforms
 
     def __len__(self):
@@ -52,25 +49,17 @@ class SegDataset(Dataset):
         img = np.array(Image.open(os.path.join(self.img_dir, self.images[idx])).convert("RGB"))
         mask = np.array(Image.open(os.path.join(self.mask_dir, self.masks[idx])))
 
-        if self.transforms:
-            augmented = self.transforms(image=img, mask=mask)
-            img, mask = augmented["image"], augmented["mask"]
+        augmented = self.transforms(image=img, mask=mask)
+        img = augmented["image"]
+        mask = augmented["mask"].long()
 
-        encoded = feature_extractor(images=img, return_tensors="pt")
-        pixel_values = encoded["pixel_values"].squeeze()
+        # Processor applied AFTER augmentations
+        encoded = self.processor(images=img, return_tensors="pt")
+        pixel_values = encoded["pixel_values"].squeeze(0)
 
-        # Fix: convert mask safely
-        if isinstance(mask, np.ndarray):
-            mask_tensor = torch.from_numpy(mask).long()
-        else:
-            mask_tensor = mask.long()  # already a tensor
+        return pixel_values, mask
 
-        return pixel_values, mask_tensor
-
-
-# ==============================
-# DATA AUGMENTATIONS
-# ==============================
+# ================= AUGMENTATION =================
 train_tf = A.Compose([
     A.HorizontalFlip(p=0.5),
     A.VerticalFlip(p=0.5),
@@ -79,185 +68,182 @@ train_tf = A.Compose([
     ToTensorV2()
 ])
 
-# ==============================
-# FEATURE EXTRACTOR
-# ==============================
-feature_extractor = SegformerImageProcessor.from_pretrained(
-    "nvidia/segformer-b0-finetuned-ade-512-512"  # smaller model
+# ================= PROCESSOR =================
+processor = SegformerImageProcessor.from_pretrained(
+    "nvidia/segformer-b0-finetuned-ade-512-512"
 )
 
-# ==============================
-# METRICS
-# ==============================
-def mean_iou(pred, target, num_classes):
-    pred = torch.argmax(pred, dim=1)
-    target_resized = F.interpolate(target.unsqueeze(1).float(), size=pred.shape[1:], mode="nearest").squeeze(1).long()
+# ================= METRICS =================
+def mean_iou(logits, targets):
+    preds = logits.argmax(dim=1)
     ious = []
-    for cls in range(num_classes):
-        pred_cls = (pred == cls)
-        target_cls = (target_resized == cls)
-        intersection = (pred_cls & target_cls).sum().float()
-        union = (pred_cls | target_cls).sum().float()
-        if union == 0:
-            continue
-        ious.append(intersection / union)
-    return torch.mean(torch.tensor(ious)) if ious else torch.tensor(0.0)
+    for c in range(num_classes):
+        inter = ((preds == c) & (targets == c)).sum().float()
+        union = ((preds == c) | (targets == c)).sum().float()
+        if union > 0:
+            ious.append(inter / union)
+    if len(ious) == 0:
+        return torch.tensor(0.0)
+    return torch.mean(torch.stack(ious)).item()
 
-# ==============================
-# DATASET AND K-FOLD
-# ==============================
-dataset = SegDataset(train_img_dir, train_mask_dir, feature_extractor, train_tf)
-all_indices = np.arange(len(dataset))
+# ================= DATASET =================
+dataset = SegDataset(img_dir, mask_dir, processor, train_tf)
 kf = KFold(n_splits=num_folds, shuffle=True, random_state=42)
 
-# CSV logging
-with open(log_file, "w", newline="") as f:
-    writer = csv.writer(f)
-    writer.writerow(["fold", "epoch", "train_loss", "train_iou", "val_loss", "val_iou"])
+# ================= COMPUTE CLASS WEIGHTS =================
+print("Computing class weights...")
+class_counts = np.zeros(num_classes)
+for _, mask in dataset:
+    mask_np = mask.numpy()
+    for c in range(num_classes):
+        class_counts[c] += (mask_np == c).sum()
 
-fold_metrics = []
+class_weights = 1.0 / (class_counts + 1e-6)
+class_weights = class_weights / class_weights.sum() * num_classes
+class_weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
+print("Class weights:", class_weights)
 
-# ==============================
-# K-FOLD TRAINING
-# ==============================
-for fold, (train_idx, val_idx) in enumerate(kf.split(all_indices), 1):
-    print(f"\n========== Fold {fold}/{num_folds} ==========")
-    torch.cuda.empty_cache()
+# ================= TRAINING =================
+fold_results = []
 
-    # Dataloaders
-    train_subset = Subset(dataset, train_idx)
-    val_subset = Subset(dataset, val_idx)
+for fold, (train_idx, val_idx) in enumerate(kf.split(dataset), 1):
 
-    train_loader = DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
-    val_loader = DataLoader(val_subset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
+    print(f"\n========== FOLD {fold}/{num_folds} ==========")
 
-    # ==============================
-    # MODEL
-    # ==============================
+    train_loader = DataLoader(
+        Subset(dataset, train_idx),
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True
+    )
+
+    val_loader = DataLoader(
+        Subset(dataset, val_idx),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=True
+    )
+
     model = SegformerForSemanticSegmentation.from_pretrained(
         "nvidia/segformer-b0-finetuned-ade-512-512",
         num_labels=num_classes,
         ignore_mismatched_sizes=True
     ).to(device)
 
-    # No freezing
-
-    # ==============================
-    # CLASS WEIGHTS
-    # ==============================
-    class_pixel_counts = np.zeros(num_classes)
-    for idx in train_idx:
-        mask = np.array(Image.open(os.path.join(train_mask_dir, dataset.masks[idx])))
-        for cls in range(num_classes):
-            class_pixel_counts[cls] += (mask == cls).sum()
-    class_weights = 1.0 / (class_pixel_counts + 1e-6)
-    class_weights = class_weights / class_weights.sum() * num_classes
-    class_weights = torch.tensor(class_weights, dtype=torch.float).to(device)
     criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
+    # Optional: use focal loss
+    # from torchmetrics.classification import MulticlassFocalLoss
+    # criterion = MulticlassFocalLoss(num_classes=num_classes, alpha=class_weights)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=0.01)
-    scaler = torch.amp.GradScaler(device='cuda')
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    scaler = GradScaler(enabled=True)
 
-    wandb.init(project="segformer_ktm_datasets", name=f"fold_{fold}", reinit=True)
-    wandb.config.update({
-        "fold": fold,
-        "num_classes": num_classes,
-        "batch_size": batch_size,
-        "learning_rate": learning_rate,
-        "num_epochs": num_epochs,
-        "image_size": image_size,
-        "patience": patience
-    })
+    wandb.init(
+        project="segformer-new-annotation_1200",
+        name=f"fold-{fold}",
+        config={
+            "fold": fold,
+            "epochs": num_epochs,
+            "batch_size": batch_size,
+            "lr": learning_rate,
+            "image_size": image_size
+        }
+    )
 
-    best_val_iou = 0.0
-    no_improve_epochs = 0
+    best_miou = 0.0
+    patience_counter = 0
 
     for epoch in range(num_epochs):
-        # TRAINING
-        model.train()
-        total_train_loss = 0.0
-        total_train_iou = 0.0
 
-        for step, (imgs, masks) in enumerate(tqdm(train_loader, desc=f"Training Fold {fold} Epoch {epoch+1}")):
-            imgs, masks = imgs.to(device), masks.to(device)
-            with torch.amp.autocast('cuda'):
-                outputs = model(pixel_values=imgs, labels=masks)
-                loss = outputs.loss
+        model.train()
+        train_loss = 0.0
+
+        for imgs, masks in tqdm(train_loader, desc=f"Fold {fold} Epoch {epoch+1}"):
+            imgs = imgs.to(device)
+            masks = masks.to(device)
+
+            optimizer.zero_grad()
+
+            with autocast(device_type="cuda"):
+                outputs = model(pixel_values=imgs)
+                logits = F.interpolate(
+                    outputs.logits,
+                    size=masks.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False
+                )
+                loss = criterion(logits, masks)
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-            optimizer.zero_grad()
 
-            total_train_loss += loss.item()
-            total_train_iou += mean_iou(outputs.logits.detach(), masks, num_classes).item()
+            train_loss += loss.item()
 
-        avg_train_loss = total_train_loss / len(train_loader)
-        avg_train_iou = total_train_iou / len(train_loader)
+        train_loss /= len(train_loader)
 
-        # VALIDATION
+        # ================= VALIDATION =================
         model.eval()
-        total_val_loss = 0.0
-        total_val_iou = 0.0
+        val_loss = 0.0
+        val_miou = 0.0
 
         with torch.no_grad():
-            for imgs, masks in tqdm(val_loader, desc=f"Validation Fold {fold}"):
-                imgs, masks = imgs.to(device), masks.to(device)
-                with torch.amp.autocast('cuda'):
-                    outputs = model(pixel_values=imgs, labels=masks)
-                    loss = outputs.loss
+            for imgs, masks in val_loader:
+                imgs = imgs.to(device)
+                masks = masks.to(device)
 
-                total_val_loss += loss.item()
-                total_val_iou += mean_iou(outputs.logits, masks, num_classes).item()
+                with autocast(device_type="cuda"):
+                    outputs = model(pixel_values=imgs)
+                    logits = F.interpolate(
+                        outputs.logits,
+                        size=masks.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False
+                    )
+                    loss = criterion(logits, masks)
 
-        avg_val_loss = total_val_loss / len(val_loader)
-        avg_val_iou = total_val_iou / len(val_loader)
+                val_loss += loss.item()
+                val_miou += mean_iou(logits, masks)
 
-        # LOGGING
-        print(f"\nFold [{fold}] Epoch [{epoch+1}/{num_epochs}]")
-        print(f"Train Loss: {avg_train_loss:.4f} | Train IoU: {avg_train_iou:.4f}")
-        print(f"Val Loss:   {avg_val_loss:.4f} | Val IoU:   {avg_val_iou:.4f}")
+        val_loss /= len(val_loader)
+        val_miou /= len(val_loader)
 
         wandb.log({
-            "Train Loss": avg_train_loss,
-            "Train IoU": avg_train_iou,
-            "Val Loss": avg_val_loss,
-            "Val IoU": avg_val_iou,
-            "Epoch": epoch + 1,
-            "Fold": fold
+            "epoch": epoch + 1,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "val_miou": val_miou
         })
 
-        with open(log_file, "a", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([fold, epoch+1, avg_train_loss, avg_train_iou, avg_val_loss, avg_val_iou])
+        print(
+            f"Epoch {epoch+1} | "
+            f"TrainLoss {train_loss:.4f} | "
+            f"ValLoss {val_loss:.4f} | "
+            f"mIoU {val_miou:.4f}"
+        )
 
-        # Save checkpoint
-        ckpt_path = os.path.join(checkpoint_dir, f"fold{fold}_epoch{epoch+1}.pth")
-        torch.save(model.state_dict(), ckpt_path)
-
-        # Early stopping
-        if avg_val_iou > best_val_iou:
-            best_val_iou = avg_val_iou
-            no_improve_epochs = 0
-            best_model_path = os.path.join(checkpoint_dir, f"best_model_fold{fold}.pth")
-            torch.save(model.state_dict(), best_model_path)
-            print(f"New best model saved for fold {fold} at epoch {epoch+1} with Val IoU = {best_val_iou:.4f}")
+        if val_miou > best_miou:
+            best_miou = val_miou
+            patience_counter = 0
+            torch.save(
+                model.state_dict(),
+                os.path.join(output_dir, f"best_model_fold{fold}.pth")
+            )
         else:
-            no_improve_epochs += 1
-            print(f"No improvement for {no_improve_epochs} epoch(s).")
+            patience_counter += 1
+            if patience_counter >= patience:
+                print("Early stopping triggered")
+                break
 
-        if no_improve_epochs >= patience:
-            print(f"Early stopping triggered for fold {fold} at epoch {epoch+1}.")
-            break
-
-    fold_metrics.append(best_val_iou)
+    fold_results.append(best_miou)
     wandb.finish()
     torch.cuda.empty_cache()
 
-# ==============================
-# SUMMARY
-# ==============================
-print("\n========== K-FOLD CROSS VALIDATION RESULTS ==========")
-for i, iou in enumerate(fold_metrics, 1):
-    print(f"Fold {i} Best Val IoU: {iou:.4f}")
-print(f"Mean Best Val IoU Across Folds: {np.mean(fold_metrics):.4f}")
+# ================= FINAL K-FOLD RESULT =================
+mean_score = np.mean(fold_results)
+std_score = np.std(fold_results)
+
+print("\n========== FINAL RESULT ==========")
+print(f"SegFormer-B0 : {mean_score:.4f} ± {std_score:.4f}")

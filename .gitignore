@@ -3,3 +3,6 @@
 /src/segformer_ktm_satellite_image_small_data
 /src/segformer_ktm_satellite_image
 /src/wandb/
+/src/segformer_ktm_datasets
+/src/segformer_prediction.png
+/new_dataset

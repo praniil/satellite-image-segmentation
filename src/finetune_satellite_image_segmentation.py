@@ -18,18 +18,18 @@ import wandb
 # ================= CONFIG =================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-num_classes = 7  # background (0) + 6 label classes
+num_classes = 7
 batch_size = 16
 learning_rate = 3e-5
-num_epochs = 100
-image_size = 512  # increased from 256 for better SegFormer performance
-patience = 10
+num_epochs = 300           # increased
+image_size = 512
+patience = 25              # increased (logic unchanged)
 num_folds = 5
 
 img_dir = "../new_dataset/images"
 mask_dir = "../new_dataset/label-mask"
 
-output_dir = "./outputs_new_annotation_1200"
+output_dir = "./outputs_new_annotation_1200_300_eph"
 os.makedirs(output_dir, exist_ok=True)
 
 # ================= DATASET =================
@@ -53,7 +53,6 @@ class SegDataset(Dataset):
         img = augmented["image"]
         mask = augmented["mask"].long()
 
-        # Processor applied AFTER augmentations
         encoded = self.processor(images=img, return_tensors="pt")
         pixel_values = encoded["pixel_values"].squeeze(0)
 
@@ -86,11 +85,41 @@ def mean_iou(logits, targets):
         return torch.tensor(0.0)
     return torch.mean(torch.stack(ious)).item()
 
+def per_class_iou(logits, targets):
+    preds = logits.argmax(dim=1)
+    out = {}
+    for c in range(num_classes):
+        inter = ((preds == c) & (targets == c)).sum().float()
+        union = ((preds == c) | (targets == c)).sum().float()
+        out[f"class_{c}_iou"] = (inter / union).item() if union > 0 else 0.0
+    return out
+
+def log_images_wandb(images, masks, logits, max_images=3):
+    preds = logits.argmax(dim=1)
+
+    images = images[:max_images].cpu()
+    masks = masks[:max_images].cpu()
+    preds = preds[:max_images].cpu()
+
+    logged = []
+    for i in range(len(images)):
+        logged.append(
+            wandb.Image(
+                images[i].permute(1, 2, 0).numpy(),
+                masks={
+                    "ground_truth": {"mask_data": masks[i].numpy()},
+                    "prediction": {"mask_data": preds[i].numpy()}
+                }
+            )
+        )
+
+    wandb.log({"qualitative_examples": logged})
+
 # ================= DATASET =================
 dataset = SegDataset(img_dir, mask_dir, processor, train_tf)
 kf = KFold(n_splits=num_folds, shuffle=True, random_state=42)
 
-# ================= COMPUTE CLASS WEIGHTS =================
+# ================= CLASS WEIGHTS =================
 print("Computing class weights...")
 class_counts = np.zeros(num_classes)
 for _, mask in dataset:
@@ -101,6 +130,7 @@ for _, mask in dataset:
 class_weights = 1.0 / (class_counts + 1e-6)
 class_weights = class_weights / class_weights.sum() * num_classes
 class_weights = torch.tensor(class_weights, dtype=torch.float32).to(device)
+
 print("Class weights:", class_weights)
 
 # ================= TRAINING =================
@@ -133,22 +163,23 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(dataset), 1):
     ).to(device)
 
     criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
-    # Optional: use focal loss
-    # from torchmetrics.classification import MulticlassFocalLoss
-    # criterion = MulticlassFocalLoss(num_classes=num_classes, alpha=class_weights)
-
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     scaler = GradScaler(enabled=True)
 
     wandb.init(
-        project="segformer-new-annotation_1200",
+        project="segformer-new-annotation-1200-300eph",
         name=f"fold-{fold}",
         config={
-            "fold": fold,
+            "model": "SegFormer-B0",
+            "dataset_size": len(dataset),
+            "num_classes": num_classes,
             "epochs": num_epochs,
             "batch_size": batch_size,
             "lr": learning_rate,
-            "image_size": image_size
+            "image_size": image_size,
+            "optimizer": "AdamW",
+            "loss": "Weighted CrossEntropy",
+            "k_folds": num_folds
         }
     )
 
@@ -177,12 +208,21 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(dataset), 1):
                 loss = criterion(logits, masks)
 
             scaler.scale(loss).backward()
+
+            # gradient norm (logging only)
+            total_norm = 0.0
+            for p in model.parameters():
+                if p.grad is not None:
+                    total_norm += p.grad.data.norm(2).item() ** 2
+            total_norm = total_norm ** 0.5
+
             scaler.step(optimizer)
             scaler.update()
 
             train_loss += loss.item()
 
         train_loss /= len(train_loader)
+        current_lr = optimizer.param_groups[0]["lr"]
 
         # ================= VALIDATION =================
         model.eval()
@@ -210,12 +250,20 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(dataset), 1):
         val_loss /= len(val_loader)
         val_miou /= len(val_loader)
 
+        class_iou_logs = per_class_iou(logits, masks)
+
         wandb.log({
             "epoch": epoch + 1,
             "train_loss": train_loss,
             "val_loss": val_loss,
-            "val_miou": val_miou
+            "val_miou": val_miou,
+            "learning_rate": current_lr,
+            "grad_norm": total_norm,
+            **class_iou_logs
         })
+
+        if epoch % 5 == 0:
+            log_images_wandb(imgs, masks, logits)
 
         print(
             f"Epoch {epoch+1} | "
@@ -241,7 +289,7 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(dataset), 1):
     wandb.finish()
     torch.cuda.empty_cache()
 
-# ================= FINAL K-FOLD RESULT =================
+# ================= FINAL RESULT =================
 mean_score = np.mean(fold_results)
 std_score = np.std(fold_results)
 

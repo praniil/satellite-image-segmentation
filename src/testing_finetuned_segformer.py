@@ -12,7 +12,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 num_classes = 7
 
 # New image directory
-img_path = "../new_dataset/images/output_140.png"  
+img_path = "../new_dataset/images/output_141.png"  
 
 # Load image
 image = Image.open(img_path).convert("RGB")
@@ -30,7 +30,7 @@ model = SegformerForSemanticSegmentation.from_pretrained(
 ).to(device)
 
 # Load fine-tuned checkpoint
-checkpoint_path = "segformer_ktm_datasets/checkpoints/best_model_fold1.pth"  
+checkpoint_path = "outputs_new_annotation_1200_300_eph/best_model_fold2.pth"  
 model.load_state_dict(torch.load(checkpoint_path, map_location=device))
 model.eval()
 
@@ -48,13 +48,13 @@ pred_mask = torch.argmax(logits.squeeze(), dim=0).cpu().numpy()
 
 # Updated color map for 7 classes
 colors = np.array([
-    [0,   0,   0],     # 0 - Background
-    [128, 0,   0],     # 1 - Residential_area
-    [0,   128, 0],     # 2 - Road
-    [0,   0,   128],   # 3 - River
-    [0,   128, 128],   # 4 - Forest
-    [128, 128, 0],     # 5 - Unused_land
-    [128, 0,   128],   # 6 - Agricultural_area
+    [0,   0,   0],     # 0 - Background (Black)
+    [128, 0,   0],     # 1 - Residential_area (Blue)
+    [0,   128, 0],     # 2 - Road (Green)
+    [0,   0,   128],   # 3 - River (Red)
+    [0,   128, 128],   # 4 - Forest (Yellow = Green + Red)
+    [128, 128, 0],     # 5 - Unused_land (Cyan = Blue + Green)
+    [128, 0,   128],   # 6 - Agricultural_area (Magenta = Blue + Red)
 ], dtype=np.uint8)
 
 seg_image = colors[pred_mask]
